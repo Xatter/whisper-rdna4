@@ -44,6 +44,23 @@ guard whose job the compression check already covers. No-speech gate is
 unchanged in both passes (it's part of decode.py, orthogonal to
 temperature). Ngram ban stays at whatever the caller passes (default
 OFF, per the M4/M5 decision) in both passes.
+
+VAD addition (Jim-approved, orchestrator directive 2026-08-10):
+`chunking="vad"` (whisper_rocm.audio.chunk_audio_vad) replaces hard-cut's
+fixed 30s grid / stride's fixed-step overlap with Silero-VAD-detected
+speech windows, greedily packed to <=30s and closed on silence gaps
+instead of mid-word. The one real refactor this required: chunk_audio /
+chunk_audio_stride / chunk_audio_vad all now return explicit per-chunk
+(offsets_s, durations_s) instead of this file deriving offsets from a
+`chunk_step` formula -- VAD windows aren't evenly spaced or sized, so
+there's no formula to derive them from, and giving hard/stride the same
+explicit shape means _decode_and_classify has exactly one code path
+(and, as a side effect, fixes a latent inaccuracy where the last,
+shorter-than-30s chunk of a hard-cut file was handed the nominal 30s as
+its chunk_duration for segments.py's "unpaired final timestamp" case).
+Everything downstream of chunking (batching, kernels, timestamps,
+guards, retry ladder) is unchanged -- VAD windows are still independent
+30s-mel-padded chunks to the model, only the windows' boundaries differ.
 """
 
 from __future__ import annotations
@@ -64,12 +81,13 @@ from . import segments as whisper_segments
 from . import tokenizer as whisper_tokenizer
 from .weights import WhisperWeights
 
-ChunkingMode = Literal["hard", "stride"]
+ChunkingMode = Literal["hard", "stride", "vad"]
 
 
 @dataclass
 class StageTimings:
     load_s: float = 0.0
+    vad_s: float = 0.0  # CPU-only Silero VAD + packing time; 0 for hard/stride
     mel_s: float = 0.0
     encode_s: float = 0.0
     decode_s: float = 0.0
@@ -85,6 +103,7 @@ class TranscribeResult:
     timings: StageTimings = field(default_factory=StageTimings)
     segments: list[dict] = field(default_factory=list)
     retry_telemetry: dict = field(default_factory=dict)
+    vad_stats: dict = field(default_factory=dict)  # populated only for chunking="vad"
 
 
 def _sync(device: torch.device):
@@ -143,7 +162,7 @@ def _decode_and_classify(
     enable_ngram_ban: bool,
     repetition_brake: bool,
     temperature: float,
-    chunk_duration: float,
+    chunk_durations: list[float],
     timings: StageTimings,
 ) -> list["retry_ladder.ChunkResult"]:
     """Runs mel -> encode -> decode -> classify for one batch's worth of
@@ -151,6 +170,11 @@ def _decode_and_classify(
     single temperature. Used for both the main t=0 pass and every retry
     rung -- the only difference between them is `temperature` and
     `repetition_brake`, both passed straight through to decode.py.
+
+    chunk_durations is per-chunk (not a single shared value) since VAD
+    windows vary in real (pre-pad) length; extract_segments uses each
+    chunk's own true duration for the "unpaired final timestamp" case
+    (open segment ends at the chunk's real end, not the 30s pad boundary).
     """
     t0 = time.perf_counter()
     audio_t = torch.from_numpy(np.stack(audio_chunks, axis=0)).to(device=device, dtype=torch.float32)
@@ -186,7 +210,7 @@ def _decode_and_classify(
         nsp = no_speech_prob_cpu[i]
         status = retry_ladder.classify(avg_lp, comp_ratio, nsp)
         segs = (
-            whisper_segments.extract_segments(row[n_prompt:], tok, chunk_offsets[i], chunk_duration)
+            whisper_segments.extract_segments(row[n_prompt:], tok, chunk_offsets[i], chunk_durations[i])
             if timestamps
             else []
         )
@@ -205,36 +229,85 @@ def _decode_and_classify(
     return out
 
 
+@dataclass
+class PreparedChunks:
+    """Output of the CPU-only phase of transcribing a file (load + chunk,
+    including VAD if that's the mode) -- everything transcribe_prepared
+    needs to go straight to GPU work. Splitting this out from transcribe_file
+    (which still does both phases back to back, unchanged behavior) is what
+    lets a caller overlap file N+1's CPU prep with file N's GPU work: see
+    bench_e2e.py's per-file loop, which prefetches the next file's
+    PreparedChunks on a background thread as soon as the current file's GPU
+    phase starts (orchestrator directive 2026-08-10, "VAD cost recovery").
+    """
+
+    chunks: list[np.ndarray]
+    chunk_offsets: list[float]
+    chunk_durations: list[float]
+    duration_s: float
+    chunking: ChunkingMode
+    vad_stats: dict = field(default_factory=dict)
+    load_s: float = 0.0
+    vad_s: float = 0.0
+
+
+def prepare_chunks(path: str, chunking: ChunkingMode = "vad") -> PreparedChunks:
+    """CPU-only: load audio + chunk it (VAD inference happens here for
+    chunking="vad"). No GPU access -- safe to call from a background thread
+    while another file's GPU work is in flight."""
+    t0 = time.perf_counter()
+    raw = whisper_audio.load_audio_mono16k(path)
+    duration_s = len(raw) / whisper_audio.SAMPLE_RATE
+    load_s = time.perf_counter() - t0
+
+    # VAD (CPU-only) is timed separately from load_s -- it's real wall-clock
+    # cost on the total pipeline even though it never touches the GPU, and
+    # lumping it into "load_s" would hide exactly the number the orchestrator
+    # asked to see reported (RTF delta, GPU time untouched).
+    vad_stats: dict = {}
+    t0 = time.perf_counter()
+    if chunking == "hard":
+        chunks, chunk_offsets, chunk_durations = whisper_audio.chunk_audio(raw)
+    elif chunking == "stride":
+        chunks, chunk_offsets, chunk_durations = whisper_audio.chunk_audio_stride(raw)
+    elif chunking == "vad":
+        (chunks, chunk_offsets, chunk_durations), vad_stats = whisper_audio.chunk_audio_vad(raw)
+    else:
+        raise ValueError(f"unknown chunking mode {chunking!r}")
+    chunks = [whisper_audio.pad_or_trim(c) for c in chunks]
+    vad_s = time.perf_counter() - t0
+
+    return PreparedChunks(
+        chunks=chunks, chunk_offsets=chunk_offsets, chunk_durations=chunk_durations,
+        duration_s=duration_s, chunking=chunking, vad_stats=vad_stats,
+        load_s=load_s, vad_s=vad_s,
+    )
+
+
 @torch.no_grad()
-def transcribe_file(
-    path: str,
+def transcribe_prepared(
+    prepared: PreparedChunks,
     weights: WhisperWeights,
     tok: whisper_tokenizer.Tokenizer,
     device: torch.device,
     batch_size: int = 16,
-    chunking: ChunkingMode = "hard",
     enable_ngram_ban: bool = False,  # see decode.py's module docstring for why
     timestamps: bool = False,
     retry_ladder_enabled: bool = True,
 ) -> TranscribeResult:
-    timings = StageTimings()
-
-    t0 = time.perf_counter()
-    raw = whisper_audio.load_audio_mono16k(path)
-    duration_s = len(raw) / whisper_audio.SAMPLE_RATE
-    if chunking == "hard":
-        chunks = whisper_audio.chunk_audio(raw)
-        chunk_step = whisper_audio.CHUNK_LENGTH
-    elif chunking == "stride":
-        chunks = whisper_audio.chunk_audio_stride(raw)
-        chunk_step = whisper_audio.CHUNK_LENGTH - 2 * 5.0  # matches chunk_audio_stride's default stride_s
-    else:
-        raise ValueError(f"unknown chunking mode {chunking!r}")
-    chunks = [whisper_audio.pad_or_trim(c) for c in chunks]
-    timings.load_s = time.perf_counter() - t0
+    """GPU phase: mel -> encode -> decode -> classify -> retry ladder, given
+    already-prepared chunks (see prepare_chunks). transcribe_file below is
+    just prepare_chunks + this, back to back, for callers that don't need
+    the two phases split."""
+    timings = StageTimings(load_s=prepared.load_s, vad_s=prepared.vad_s)
+    chunks, chunk_offsets, chunk_durations = (
+        prepared.chunks, prepared.chunk_offsets, prepared.chunk_durations
+    )
+    duration_s = prepared.duration_s
+    chunking = prepared.chunking
+    vad_stats = prepared.vad_stats
 
     n_prompt = len(whisper_tokenizer.PROMPT_TIMESTAMPS if timestamps else whisper_tokenizer.PROMPT)
-    chunk_offsets = [i * chunk_step for i in range(len(chunks))]
 
     # ---- main pass: batched greedy (t=0), same as before M6 ----
     results: list[retry_ladder.ChunkResult] = [None] * len(chunks)  # type: ignore[list-item]
@@ -244,7 +317,7 @@ def transcribe_file(
             [chunks[i] for i in idxs], [chunk_offsets[i] for i in idxs],
             weights, tok, device, n_prompt, timestamps, enable_ngram_ban,
             repetition_brake=True, temperature=0.0,
-            chunk_duration=whisper_audio.CHUNK_LENGTH, timings=timings,
+            chunk_durations=[chunk_durations[i] for i in idxs], timings=timings,
         )
         for i, r in zip(idxs, batch_results):
             results[i] = r
@@ -264,7 +337,7 @@ def transcribe_file(
                     [chunks[i] for i in idxs], [chunk_offsets[i] for i in idxs],
                     weights, tok, device, n_prompt, timestamps, enable_ngram_ban,
                     repetition_brake=False, temperature=t,
-                    chunk_duration=whisper_audio.CHUNK_LENGTH, timings=timings,
+                    chunk_durations=[chunk_durations[i] for i in idxs], timings=timings,
                 )
                 for i, r in zip(idxs, batch_results):
                     results[i] = r  # keep-last: always update, regardless of status
@@ -286,6 +359,9 @@ def transcribe_file(
     if chunking == "stride":
         text = _lcs_merge(chunk_texts)
     else:
+        # hard and vad windows are both non-overlapping (vad closes on
+        # silence gaps instead of a fixed grid, but never overlaps) -- plain
+        # join, no LCS stitch needed.
         text = " ".join(t for t in chunk_texts if t)
 
     return TranscribeResult(
@@ -296,4 +372,30 @@ def transcribe_file(
         segments=all_segments,
         timings=timings,
         retry_telemetry=telemetry.as_dict(),
+        vad_stats=vad_stats,
+    )
+
+
+def transcribe_file(
+    path: str,
+    weights: WhisperWeights,
+    tok: whisper_tokenizer.Tokenizer,
+    device: torch.device,
+    batch_size: int = 16,
+    chunking: ChunkingMode = "vad",  # default since 2026-08-10 (Jim's decision) -- see RESULTS.md's
+    # "VAD chunking mode" section: divergence roughly halved vs hard-cut at every measured config,
+    # stall-window rate 0.60% -> 0.11%; hard/stride remain available for comparison/fallback.
+    enable_ngram_ban: bool = False,
+    timestamps: bool = False,
+    retry_ladder_enabled: bool = True,
+) -> TranscribeResult:
+    """prepare_chunks + transcribe_prepared, back to back -- unchanged
+    single-call behavior for callers that don't need the CPU/GPU phases
+    split (bench_e2e.py's prefetch loop calls the two phases directly
+    instead, to overlap file N+1's CPU prep with file N's GPU work)."""
+    prepared = prepare_chunks(path, chunking=chunking)
+    return transcribe_prepared(
+        prepared, weights, tok, device, batch_size=batch_size,
+        enable_ngram_ban=enable_ngram_ban, timestamps=timestamps,
+        retry_ladder_enabled=retry_ladder_enabled,
     )

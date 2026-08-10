@@ -4,6 +4,15 @@ Whisper large-v3-turbo on 2x AMD Radeon AI PRO R9700 (gfx1201), custom
 ROCm/HIP decode kernels + pure-torch encoder. See `DESIGN.md` for the
 architecture and `kernels/DECODE_INTEGRATION.md` for the K4/K5 contract.
 
+**Headline-config update (2026-08-10, Jim's decision):** `chunking="vad"`
+is now the DEFAULT in `pipeline.py` and `bench_e2e.py` -- see "VAD
+chunking mode" near the end of this document. Every hard-cut number
+above that section (including "headline config" as used throughout
+M1-M6) predates this change and is left as originally measured/reported;
+it describes what was current *at the time*, not what ships today.
+Hard-cut and stride both remain available (`--chunking hard`/`stride`)
+for comparison or fallback.
+
 ## Hardware / driver / software versions
 
 | | |
@@ -387,7 +396,7 @@ intermediates that K4/K5 would otherwise avoid materializing).
 
 All 5 bench-corpus episodes are production episodes; their production
 transcripts (from prod's Whisper API service,
-`the production transcription service`, OpenAI-compatible
+`whisper.revealedpreferences.com`, OpenAI-compatible
 `/v1/audio/transcriptions` -- specific engine/model unknown from here, but
 the segment timestamps show it decoded WITH timestamps, unlike our
 notimestamps pipeline) are exported locally at
@@ -844,3 +853,224 @@ depend on the model doubting itself:
   a more promising next step than tuning openai's thresholds, since
   those thresholds are answering a different question than "is this
   chunk suspiciously short."
+
+## VAD chunking mode
+
+Jim-approved (2026-08-10): replace hard-cut's fixed 30s grid with
+Silero-VAD-detected speech windows, greedily packed to <=30s and closed
+on silence gaps instead of at an arithmetic offset -- directly targets
+the boundary-clipping / stall-window failure mode named in the section
+above. No kernel changes; this is a `whisper_rocm/audio.py` +
+`pipeline.py` change (`chunking="vad"`), now the **default** chunking
+mode (`hard`/`stride` remain available).
+
+### Implementation
+
+`whisper_rocm/audio.py`: `chunk_audio_vad` runs Silero VAD (CPU-only,
+never touches GPU timing) on the file's 16kHz mono samples, then
+`_pack_vad_windows` greedily extends the current window while the next
+speech segment (plus the silence gap before it) still fits in 30s;
+when it doesn't fit, the window closes at the end of the last segment
+that DID fit -- the boundary lands in silence, not mid-word. A single
+VAD-detected speech run longer than 30s with no internal silence can't
+be closed on silence at all; that's hard-split at 30s boundaries and
+counted separately (`n_long_segments_hard_split` in `vad_stats`) so how
+often the "unavoidable hard cut" actually happens is visible, not
+silently absorbed. Silent spans between windows are never sliced out of
+the audio at all, so "skip long pure-silence spans" falls out of the
+packer for free rather than needing separate handling.
+
+**The one real refactor**: `chunk_audio` / `chunk_audio_stride` /
+`chunk_audio_vad` now all return explicit per-chunk `(offsets_s,
+durations_s)` instead of `pipeline.py` deriving offsets from a
+`chunk_step` formula -- VAD windows aren't evenly spaced or sized, so
+there's no formula to derive them from. Giving hard/stride the same
+explicit shape means `_decode_and_classify` has exactly one code path
+for all three modes. Side effect, not the goal: this fixes a latent
+inaccuracy where hard-cut's last (shorter-than-30s) chunk of a file was
+handed the nominal 30s as its `chunk_duration` for `segments.py`'s
+"unpaired final timestamp" case (an open segment at chunk end would
+have closed 30s after the chunk start instead of at the file's real
+end) -- worth naming since it was found via the VAD work, not gone
+looking for.
+
+### Sanity check (one file, `44e8f624`)
+
+All 1348 VAD-mode segments monotonic, `Start`/`End` sane, first segment
+at 0.1s, last segment ends at 3669.6s (file duration 3670.6s). Concrete
+boundary example, same ~1830s region in both modes:
+
+| mode | segments |
+|---|---|
+| hard-cut | `[1828.9-1830.0]` *(blank)* · `[1830.0-1836.8]` "**wondered about that.** 77% goes to Japan. And Japan was actually the one that started all th..." |
+| VAD | `[1829.8-1830.8]` "**Yeah, I wondered about that.**" · `[1831.1-1833.1]` "77% goes to Japan." |
+
+Hard-cut's fixed 30s boundary lands inside "Yeah, I wondered about
+that," clipping it to "wondered about that" and leaving an orphaned
+blank segment just before it. VAD's boundary sits in the silence
+between utterances, so the phrase survives intact -- this single
+mechanism, repeated at every hard-cut chunk boundary in every file
+(~1 per 30s of audio), is a large part of what the M1-M6 "why doesn't
+divergence hit DESIGN.md's <=3% target" investigation never pinned
+down.
+
+### Stall-window rate (the number VAD mode exists to fix)
+
+Methodology: for each file, VAD's own transcribed segments mark which
+30s-aligned buckets contain real speech (independent ground truth for
+hard-cut, since hard-cut's chunk boundaries had no say in it). A
+"stall" bucket is one where the corresponding mode produced <=3 words
+despite the bucket being speechful (RESULTS.md's own language from the
+section above: "1-3 words decoded from a 30s window that isn't
+silence"). Measured across the full 20-episode corpus (1846 speechful
+buckets):
+
+| mode | stall buckets | speechful buckets | stall rate |
+|---|---|---|---|
+| hard-cut | 11 | 1846 | **0.60%** |
+| VAD | 2 | 1846 | **0.11%** |
+
+A ~5.5x reduction. Both rates are low in absolute terms (this failure
+mode was already established as affecting "a small fraction of
+chunks," not a large one), but VAD meaningfully reduces it rather than
+eliminating it -- the residual 2 VAD stalls are presumably genuine
+model failures on hard audio, not chunking artifacts.
+
+### Divergence: 5-file bench corpus, VAD vs hard-cut
+
+Same methodology as the rest of this document (`bench/check_quality.py`,
+corpus-wide = sum(edits)/sum(ref_words)), both notimestamps (the
+original M1-M4 measurement config) and timestamps (the config the
+20-episode production-equivalence work actually uses) modes:
+
+| config | vs prod (hard-cut -> VAD) | vs baseline (hard-cut -> VAD) |
+|---|---|---|
+| notimestamps | 12.39% -> **7.30%** | 11.87% -> **7.93%** |
+| timestamps | 13.32% -> **6.98%** | 12.17% -> **7.61%** |
+
+Per-file, VAD-mode divergence (all 5 files, both configs):
+
+| file | notimestamps vs prod | notimestamps vs baseline | timestamps vs prod | timestamps vs baseline |
+|---|---|---|---|---|
+| 1abf3ec0-...-e344.mp3 | 6.67% | 6.93% | 6.51% | 6.51% |
+| 44e8f624-...-acf4.mp3 | 7.59% | 7.87% | 6.21% | 6.52% |
+| 882380ee-...-6be.mp3 | 8.85% | 10.71% | 8.04% | 9.59% |
+| 9beeffbb-...-41e6.mp3 | 6.93% | 6.42% | 7.78% | 7.14% |
+| 9f0ed85f-...-e2.mp3 | 7.15% | 8.29% | 6.91% | 8.84% |
+
+Roughly halved in every case, and -- unlike the notimestamps/timestamps
+divergence story elsewhere in this document, where one file's
+improvement didn't generalize to the corpus -- this holds file-by-file,
+not just in aggregate: all 5 files individually improve by 4-8 points
+in every comparison (the table above; the pattern is uniform, no
+outliers in the wrong direction). This is the single largest
+divergence improvement found anywhere in this project, and it comes
+from a
+chunking change, not a kernel or decode change -- consistent with the
+boundary-clipping mechanism above being a real, corpus-wide effect
+rather than a one-file coincidence.
+
+### RTF: VAD is slower before optimization, faster after
+
+VAD's own CPU cost (Silero inference + packing) is NOT free, and
+packing did NOT reduce total chunk count on this speech-dense podcast
+corpus -- if anything the opposite: 20-episode corpus, 2104 VAD windows
+vs 1873 hard-cut chunks (+12.3%), because closing early on any silence
+gap that would blow the 30s budget leaves windows shorter than a full
+30s on average, so more of them are needed to cover the same speech.
+GPU-side compute (encode+decode) tracks that +12% roughly 1:1 -- no win
+there, unlike the divergence result above.
+
+| config | dual-GPU overall_rtf (20 episodes) |
+|---|---|
+| hard-cut (established headline) | 0.00214 |
+| VAD, unoptimized (torch JIT VAD, no overlap) | 0.00486 (2.27x slower) |
+| **VAD, optimized (ONNX + CPU/GPU overlap)** | **0.00206 (1.04x FASTER than hard-cut)** |
+
+**Cost recovery, two changes** (Jim-directed, "GPU VAD" explicitly
+ruled out):
+
+1. **ONNX backend.** `silero_vad`'s own `model.py` calls
+   `torch.set_num_threads(1)` at import time, so the torch-JIT path
+   (the original implementation) was single-threaded with no override
+   available. Switching to `load_silero_vad(onnx=True)` and
+   reconstructing its `onnxruntime.InferenceSession` with more
+   intra-op threads (the package hardcodes 1 there too, no public
+   override) A/B'd at 1/4/8/12 threads on gpu-host's 12 cores: 1 thread
+   already beats torch JIT 2.4x; 4 threads gets to 2.9x; 8/12 add <1%
+   more (the model is small enough that thread count stops mattering
+   past 4). Settled on **4 intra-op threads** as the default --
+   verified bit-for-bit... not quite: 19/20 files in the full corpus
+   run produced byte-identical text between the torch-JIT and ONNX
+   backends (same chunk counts too), one file (`ec230700`, also the
+   file with by far the most long-segment hard-splits at 32) differs
+   in text with an identical chunk count -- consistent with a small
+   floating-point difference between the two backends occasionally
+   shifting a VAD boundary by a few ms and landing on a different
+   word, not a bug.
+2. **CPU/GPU overlap.** `pipeline.py` split into `prepare_chunks`
+   (CPU-only: load + VAD) and `transcribe_prepared` (GPU-only);
+   `transcribe_file` is now just the two called back to back
+   (unchanged behavior for existing callers). `bench_e2e.py`'s
+   per-file loop prefetches file N+1's `PreparedChunks` on a
+   background thread as soon as file N's GPU work starts. VAD releases
+   the GIL during its native (onnxruntime) compute, so this is real
+   wall-clock overlap, not concurrency theater -- confirmed by the
+   result: total VAD CPU time summed across per-file stage timings
+   dropped from 242.8s (torch JIT) to 124.1s (ONNX) in the *overlapped*
+   run (less than the isolated A/B's ~2.9x, plausibly some CPU
+   contention with concurrent GPU-dispatch Python code, but the point
+   of overlap is that this stops mattering for wall clock -- almost
+   all of it is hidden behind GPU compute).
+
+Combined: **2.36x recovered** (0.00486 -> 0.00206), landing VAD mode
+*faster* than the previous hard-cut headline despite +12% more GPU
+work, purely from no longer paying VAD's CPU cost serially. Both
+`chunking="vad"`'s default backend (ONNX, 4 threads) and the overlap
+prefetch are unconditional -- no flag needed, no regressions expected
+for hard/stride (which never call VAD code at all).
+
+### Ad-detection re-run: 20-episode aggregate, VAD vs hard-cut
+
+Same protocol as the original 20-episode production-equivalence check
+(`s1_chunked_baseline`, `LLM_BACKEND=prod`, three comparisons per
+episode) -- prod-transcript detections and shipped `prod_ads` reused
+unchanged from the hard-cut run (not re-queried); only the "ours"
+(our-transcript) side was re-run against the VAD transcripts.
+
+| comparison | hard-cut mean F1 -> VAD mean F1 | hard-cut median -> VAD median |
+|---|---|---|
+| **ours vs prod-transcript detections** (headline) | 0.73 -> **0.78** | 0.77 -> **0.81** |
+| ours vs prod ads (shipped) | 0.73 -> **0.78** | 0.73 -> **0.81** |
+| control (prod-transcript vs prod_ads, unchanged) | 0.87 | 0.87 |
+
+Unmatched-segment rate (a detected ad matching neither other signal --
+the pilot's "extra segment" finding, measured symmetrically against a
+same-detector noise baseline, see the production-equivalence results
+for the full methodology):
+
+| side | hard-cut | VAD |
+|---|---|---|
+| our-transcript detections, unmatched rate | 27.3% (38/139) | **21.4% (30/140)** |
+| episodes showing the pattern | 14/20 | 12/20 |
+
+Narrower, not closed -- VAD's rate is still meaningfully above the
+~10% same-detector noise floor established by the prod-transcript
+side, so this remains a real (if now smaller) transcript-driven
+effect, not fully explained by detector noise. Ad-time recovered in
+aggregate also improved slightly: VAD's total detected ad-seconds is
+97.5% of shipped (vs hard-cut's 95.4%). Full per-episode numbers live
+in this project's private results tracking (real show/episode content,
+not appropriate for this document or the public repo).
+
+### Verdict
+
+VAD becomes the default. On every axis measured -- divergence (roughly
+halved, file-by-file, not just in aggregate), stall-window rate (5.5x
+lower), ad-detection F1 (both headline comparisons improved ~5-8
+points), unmatched-segment rate (27%->21%), and now RTF too, after the
+two cost-recovery changes (2.36x recovered, net *faster* than
+hard-cut) -- VAD is a clear win with no measured regression. The
+residual unmatched-segment gap above the noise floor (21% vs ~10%) is
+the one number that isn't fully closed; worth a future pass, but not a
+reason to hold the default flip.

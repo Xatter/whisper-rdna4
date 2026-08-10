@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -84,23 +85,41 @@ def _run_single_or_worker(args) -> dict:
     torch.cuda.synchronize(device)
     load_s = time.perf_counter() - t0
 
-    # One warmup batch (compile/alloc effects, clock ramp after WoL/idle) -- DESIGN.md S9.
-    _ = whisper_pipeline.transcribe_file(
-        files[0], w, tok, device, batch_size=args.batch_size, chunking=args.chunking,
-        enable_ngram_ban=args.ngram_ban, timestamps=args.timestamps,
-        retry_ladder_enabled=not args.no_retry_ladder,
-    )
-    torch.cuda.synchronize(device)
+    def _prepare(f):
+        return whisper_pipeline.prepare_chunks(f, chunking=args.chunking)
 
-    per_file = []
-    corpus_wall_t0 = time.perf_counter()
-    for f in files:
-        t0 = time.perf_counter()
-        result = whisper_pipeline.transcribe_file(
-            f, w, tok, device, batch_size=args.batch_size, chunking=args.chunking,
+    def _transcribe(prepared):
+        return whisper_pipeline.transcribe_prepared(
+            prepared, w, tok, device, batch_size=args.batch_size,
             enable_ngram_ban=args.ngram_ban, timestamps=args.timestamps,
             retry_ladder_enabled=not args.no_retry_ladder,
         )
+
+    # One warmup pass (compile/alloc effects, clock ramp after WoL/idle) -- DESIGN.md S9.
+    warmup_prepared = _prepare(files[0])
+    _ = _transcribe(warmup_prepared)
+    torch.cuda.synchronize(device)
+
+    # CPU/GPU overlap (orchestrator directive 2026-08-10, "VAD cost
+    # recovery"): while file N's GPU work runs below, a background thread
+    # prepares file N+1's chunks (audio load + VAD if chunking="vad"), so
+    # file N+1's GPU work can start the instant file N's finishes instead of
+    # blocking on VAD CPU time again. VAD releases the GIL during its native
+    # (onnxruntime/torch) compute, so this is genuine wall-clock overlap, not
+    # concurrency theater. File 0 reuses warmup_prepared directly (already
+    # computed above) rather than re-running VAD on it a second time.
+    prefetch_pool = ThreadPoolExecutor(max_workers=1)
+    next_future: "Future" = Future()
+    next_future.set_result(warmup_prepared)
+
+    per_file = []
+    corpus_wall_t0 = time.perf_counter()
+    for idx, f in enumerate(files):
+        t0 = time.perf_counter()
+        prepared = next_future.result()
+        if idx + 1 < len(files):
+            next_future = prefetch_pool.submit(_prepare, files[idx + 1])
+        result = _transcribe(prepared)
         wall_s = time.perf_counter() - t0
         rtf = wall_s / result.duration_s if result.duration_s > 0 else float("nan")
         per_file.append(
@@ -113,8 +132,10 @@ def _run_single_or_worker(args) -> dict:
                 "text": result.text,
                 "segments": result.segments,
                 "retry_telemetry": result.retry_telemetry,
+                "vad_stats": result.vad_stats,
                 "stage_timings_s": {
                     "load": result.timings.load_s,
+                    "vad": result.timings.vad_s,  # CPU-only, 0 for hard/stride
                     "mel": result.timings.mel_s,
                     "encode": result.timings.encode_s,
                     "decode": result.timings.decode_s,
@@ -123,9 +144,19 @@ def _run_single_or_worker(args) -> dict:
             }
         )
     corpus_wall_s = time.perf_counter() - corpus_wall_t0
+    prefetch_pool.shutdown(wait=False)
 
     total_duration = sum(pf["duration_s"] for pf in per_file)
     total_wall = sum(pf["wall_s"] for pf in per_file)
+    # overall_rtf uses corpus_wall_s (the actual wall clock spanning the
+    # whole loop), not sum(per-file wall_s): with the CPU/GPU overlap above,
+    # per-file wall_s is now just each file's GPU-critical-path time (its
+    # chunks were already prefetched), so summing it would understate real
+    # elapsed time by hiding the one file's worth of CPU prep that can't be
+    # overlapped with anything (the last file's tail, or the whole first
+    # file if the corpus has only one). corpus_wall_s is the same "one wall
+    # clock over the whole run" metric --mode dual already treats as
+    # authoritative, applied here to single/worker mode too.
     return {
         "batch_size": args.batch_size,
         "use_kernels": args.use_kernels,
@@ -137,7 +168,7 @@ def _run_single_or_worker(args) -> dict:
         "per_file": per_file,
         "total_audio_duration_s": total_duration,
         "total_wall_s": total_wall,
-        "overall_rtf": total_wall / total_duration if total_duration > 0 else float("nan"),
+        "overall_rtf": corpus_wall_s / total_duration if total_duration > 0 else float("nan"),
         "corpus_wall_s": corpus_wall_s,
     }
 
@@ -272,8 +303,10 @@ def main():
     ap.add_argument("--files", default=None, help="comma-separated filenames to restrict to")
     ap.add_argument("--use-kernels", action="store_true", help="enable Agent C's K4/K5 kernels")
     ap.add_argument(
-        "--chunking", choices=["hard", "stride"], default="hard",
-        help="hard = non-overlapping 30s chunks; stride = 30s window, 5s stride each side, LCS merge",
+        "--chunking", choices=["hard", "stride", "vad"], default="vad",
+        help="vad (default since 2026-08-10) = Silero-VAD speech windows greedily packed to <=30s, "
+             "closed on silence gaps; hard = non-overlapping 30s chunks; stride = 30s window, 5s "
+             "stride each side, LCS merge",
     )
     ap.add_argument(
         "--ngram-ban", action="store_true",

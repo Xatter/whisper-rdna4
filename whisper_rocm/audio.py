@@ -11,6 +11,7 @@ STFT + framing below is our own batched implementation.
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 
 import numpy as np
@@ -65,21 +66,35 @@ def load_audio_mono16k(path: str) -> np.ndarray:
     return audio
 
 
-def chunk_audio(audio: np.ndarray, chunk_length_s: float = CHUNK_LENGTH) -> list[np.ndarray]:
+ChunkSpec = tuple[list[np.ndarray], list[float], list[float]]  # (chunks, offsets_s, durations_s)
+
+
+def chunk_audio(audio: np.ndarray, chunk_length_s: float = CHUNK_LENGTH) -> ChunkSpec:
     """Split into non-overlapping chunks of `chunk_length_s` seconds
     (DESIGN.md S5: "same as baseline: 375 chunks for 11235s", no stride).
     The last chunk is short; callers pad it (pad_or_trim) before batching.
+
+    Returns (chunks, offsets_s, durations_s) -- offsets/durations are each
+    chunk's TRUE (pre-pad) position and length in the file's timeline. VAD
+    mode (chunk_audio_vad) needs genuinely per-chunk offsets/durations since
+    its windows aren't evenly spaced or sized; hard/stride mode's are a
+    trivial arithmetic sequence, but returning them in the same explicit
+    per-chunk shape (rather than a step formula the caller reconstructs)
+    means pipeline.py has exactly one code path for all three modes -- see
+    pipeline.py's transcribe_file.
     """
     n = int(chunk_length_s * SAMPLE_RATE)
     chunks = [audio[i : i + n] for i in range(0, len(audio), n)]
     if len(chunks) == 0:
         chunks = [np.zeros(n, dtype=np.float32)]
-    return chunks
+    offsets = [i * chunk_length_s for i in range(len(chunks))]
+    durations = [len(c) / SAMPLE_RATE for c in chunks]
+    return chunks, offsets, durations
 
 
 def chunk_audio_stride(
     audio: np.ndarray, window_s: float = CHUNK_LENGTH, stride_s: float = 5.0
-) -> list[np.ndarray]:
+) -> ChunkSpec:
     """HF-pipeline-style overlapping windows (M2 quality guard, orchestrator
     directive 2026-08-09): 30s window, 5s stride on each side (transformers'
     AutomaticSpeechRecognitionPipeline default is stride_length_s =
@@ -90,6 +105,8 @@ def chunk_audio_stride(
     window_s - 2*stride_s = 20s of new content per window. The last window
     is short; callers pad it (pad_or_trim) before batching. Overlap is
     resolved at merge time by pipeline.py's LCS-based text stitch, not here.
+
+    Returns (chunks, offsets_s, durations_s), see chunk_audio's docstring.
     """
     window = int(window_s * SAMPLE_RATE)
     stride = int(stride_s * SAMPLE_RATE)
@@ -97,15 +114,232 @@ def chunk_audio_stride(
     assert step > 0, "stride_s too large relative to window_s"
     n = len(audio)
     chunks = []
+    offsets = []
     start = 0
     while True:
         chunks.append(audio[start : start + window])
+        offsets.append(start / SAMPLE_RATE)
         if start + window >= n:
             break
         start += step
     if not chunks:
         chunks = [np.zeros(window, dtype=np.float32)]
-    return chunks
+        offsets = [0.0]
+    durations = [len(c) / SAMPLE_RATE for c in chunks]
+    return chunks, offsets, durations
+
+
+# ---------------------------------------------------------------------------
+# VAD chunking (Jim-approved, orchestrator directive 2026-08-10). Silero VAD
+# on CPU picks real speech boundaries; a faster-whisper/WhisperX-style greedy
+# packer merges consecutive speech segments into <=30s windows so encoder
+# calls spend less time on silence and chunk boundaries fall in silence
+# instead of mid-word. GPU timing is untouched -- VAD runs entirely on CPU
+# before any GPU work starts.
+# ---------------------------------------------------------------------------
+
+VAD_MAX_WINDOW_S = CHUNK_LENGTH  # 30s, same encoder/mel budget as hard/stride
+
+
+def _stub_torchaudio_if_broken() -> None:
+    """silero_vad.utils_vad does an unconditional `import torchaudio` even
+    though we never call its read_audio/save_audio helpers (we always pass
+    an already-loaded tensor straight in). On gpu-host's ROCm build
+    (torch 2.13.0+rocm7.2), the torchaudio wheel pip pulls in as a dependency
+    is a stock CUDA/CPU build with an incompatible compiled extension --
+    `import torchaudio` raises OSError ("Could not load this library:
+    .../_torchaudio.abi3.so") from its C-extension loader, not the more
+    easily-caught ImportError. Since nothing we use needs torchaudio's
+    actual functionality, pre-registering an empty stub module (only if a
+    real import genuinely fails) lets silero_vad's own `import torchaudio`
+    line succeed as a no-op instead of taking down the whole VAD path over
+    a dependency we don't exercise.
+    """
+    import sys
+
+    if "torchaudio" in sys.modules:
+        return
+    try:
+        import torchaudio  # noqa: F401
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+        import types
+
+        stub = types.ModuleType("torchaudio")
+        stub.__silero_vad_stub_reason__ = repr(exc)
+        sys.modules["torchaudio"] = stub
+
+
+VAD_ONNX_INTRA_OP_THREADS = 4  # A/B'd 1/4/8/12 (2026-08-10): 1 thread already
+# beats the torch JIT path 2.4x (silero_vad's own model.py hardcodes
+# torch.set_num_threads(1) at import time, so the JIT path never had a
+# chance); 4 threads gets the rest of the win (2.9x total). 8/12 add <1%
+# more -- this model is small enough that thread count past 4 stops
+# mattering, so 4 is the practical choice rather than reserving all cores.
+
+
+def _load_vad_model_onnx(intra_op_threads: int = VAD_ONNX_INTRA_OP_THREADS):
+    """Loads Silero VAD via onnxruntime instead of the torch JIT path --
+    2.4-2.9x faster in direct A/B (see VAD_ONNX_INTRA_OP_THREADS' comment),
+    the default backend since 2026-08-10. silero_vad's own
+    load_silero_vad(onnx=True) (silero_vad/utils_vad.py's OnnxWrapper)
+    hardcodes both inter- and intra-op thread counts to 1 regardless of
+    what's asked for, so this reconstructs the onnxruntime session
+    afterward with more intra-op threads when requested -- the model path
+    is re-derived the same way load_silero_vad(onnx=True) does internally
+    (there's no public accessor for it on the returned wrapper).
+    """
+    _stub_torchaudio_if_broken()
+    from silero_vad import get_speech_timestamps, load_silero_vad
+
+    model = load_silero_vad(onnx=True)
+    if intra_op_threads and intra_op_threads > 1:
+        import onnxruntime
+
+        try:
+            import importlib_resources as impresources
+        except ImportError:
+            from importlib import resources as impresources
+        model_path = str(impresources.files("silero_vad.data").joinpath("silero_vad.onnx"))
+        opts = onnxruntime.SessionOptions()
+        opts.intra_op_num_threads = intra_op_threads
+        opts.inter_op_num_threads = 1
+        model.session = onnxruntime.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"], sess_options=opts
+        )
+    return model, get_speech_timestamps
+
+
+@lru_cache(maxsize=1)
+def _load_vad_model():
+    """Loads Silero VAD once per process, CPU only. Tries onnxruntime first
+    (default backend since 2026-08-10, see _load_vad_model_onnx); falls back
+    to the `silero-vad` pip package's torch JIT path if onnxruntime isn't
+    installed, then to torch.hub if the package itself isn't installed
+    (torch.hub.load('snakers4/silero-vad', ...) is the older but still-
+    supported path and some environments may have it cached already).
+    """
+    _stub_torchaudio_if_broken()
+    try:
+        import onnxruntime  # noqa: F401
+
+        return _load_vad_model_onnx()
+    except ImportError:
+        pass
+    try:
+        from silero_vad import get_speech_timestamps, load_silero_vad
+
+        model = load_silero_vad()
+        return model, get_speech_timestamps
+    except ImportError:
+        pass
+
+    model, utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True
+    )
+    get_speech_timestamps = utils[0]
+    return model, get_speech_timestamps
+
+
+def _vad_speech_segments(audio: np.ndarray) -> list[tuple[float, float]]:
+    """Runs Silero VAD on CPU, returns [(start_s, end_s), ...] speech
+    segments, sorted, non-overlapping (Silero's own contract)."""
+    model, get_speech_timestamps = _load_vad_model()
+    wav = torch.from_numpy(audio.astype(np.float32))
+    timestamps = get_speech_timestamps(
+        wav, model, sampling_rate=SAMPLE_RATE, return_seconds=True
+    )
+    return [(float(t["start"]), float(t["end"])) for t in timestamps]
+
+
+def _pack_vad_windows(
+    speech_segments: list[tuple[float, float]], max_window_s: float = VAD_MAX_WINDOW_S
+) -> tuple[list[tuple[float, float]], dict]:
+    """faster-whisper/WhisperX-style greedy packer: extend the current
+    window while the next speech segment (plus the silence gap before it)
+    still fits within max_window_s; when it doesn't fit, close the window
+    at the end of the last segment that DID fit -- the boundary lands in
+    the silence gap before the next segment, not mid-speech. A single VAD
+    segment longer than max_window_s on its own (an uninterrupted speech
+    run with no detected silence) can't be closed on silence at all; that
+    case is hard-split at max_window_s boundaries, counted separately so
+    it's visible how often the "unavoidable hard cut" actually happens.
+
+    Returns (windows, stats) where windows is [(start_s, end_s), ...] and
+    stats has n_speech_segments, n_windows, n_long_segments_hard_split,
+    n_hard_split_subwindows.
+    """
+    windows: list[tuple[float, float]] = []
+    n_long_segments_hard_split = 0
+    n_hard_split_subwindows = 0
+
+    i = 0
+    n = len(speech_segments)
+    while i < n:
+        win_start, win_end = speech_segments[i]
+        j = i + 1
+        while j < n:
+            next_start, next_end = speech_segments[j]
+            if next_end - win_start <= max_window_s:
+                win_end = next_end
+                j += 1
+            else:
+                break
+
+        if win_end - win_start > max_window_s:
+            # Only possible when j == i+1: segment i alone already exceeds
+            # the window budget (a long uninterrupted speech run). Hard-split
+            # it -- there's no silence anywhere in this span to close on.
+            n_long_segments_hard_split += 1
+            seg_dur = win_end - win_start
+            n_splits = math.ceil(seg_dur / max_window_s)
+            n_hard_split_subwindows += n_splits
+            for k in range(n_splits):
+                s = win_start + k * max_window_s
+                e = min(win_start + (k + 1) * max_window_s, win_end)
+                windows.append((s, e))
+        else:
+            windows.append((win_start, win_end))
+
+        i = j
+
+    stats = {
+        "n_speech_segments": n,
+        "n_windows": len(windows),
+        "n_long_segments_hard_split": n_long_segments_hard_split,
+        "n_hard_split_subwindows": n_hard_split_subwindows,
+    }
+    return windows, stats
+
+
+def chunk_audio_vad(audio: np.ndarray, max_window_s: float = VAD_MAX_WINDOW_S) -> tuple[ChunkSpec, dict]:
+    """VAD-packed chunking: Silero VAD (CPU) finds speech segments, then
+    _pack_vad_windows greedily merges them into <=30s windows, closing on
+    silence gaps rather than at a fixed arithmetic offset. Silent spans
+    between windows are never sliced out of `audio` at all, so they never
+    reach the encoder -- "skip long pure-silence spans" falls out of this
+    for free rather than needing separate handling.
+
+    A file with NO detected speech at all (e.g. dead air) falls back to one
+    zero-length-safe window covering the whole file, matching hard/stride's
+    "never return an empty chunk list" contract.
+
+    Returns ((chunks, offsets_s, durations_s), vad_stats).
+    """
+    speech_segments = _vad_speech_segments(audio)
+    if not speech_segments:
+        chunks, offsets, durations = chunk_audio(audio, chunk_length_s=max_window_s)
+        stats = {
+            "n_speech_segments": 0, "n_windows": len(chunks),
+            "n_long_segments_hard_split": 0, "n_hard_split_subwindows": 0,
+            "fell_back_to_hard_cut_no_speech": True,
+        }
+        return (chunks, offsets, durations), stats
+
+    windows, stats = _pack_vad_windows(speech_segments, max_window_s)
+    chunks = [audio[int(s * SAMPLE_RATE) : int(e * SAMPLE_RATE)] for s, e in windows]
+    offsets = [s for s, _e in windows]
+    durations = [e - s for s, e in windows]
+    return (chunks, offsets, durations), stats
 
 
 def pad_or_trim(audio: np.ndarray, length: int = N_SAMPLES) -> np.ndarray:
