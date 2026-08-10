@@ -39,6 +39,82 @@ chunks: switching the VAD backend from Silero's torch-JIT path (hardcoded to
 file N's GPU work via a background-thread prefetch in the per-file loop.
 See `RESULTS.md`'s "VAD chunking mode" section for the full breakdown.
 
+## Try it with Docker
+
+No local ROCm/PyTorch install needed — everything runs inside the container.
+You still need the host's `amdgpu` kernel driver and `/dev/kfd` + `/dev/dri`
+present, same as any ROCm container workload.
+
+```bash
+git clone https://github.com/Xatter/whisper-rdna4.git
+cd whisper-rdna4
+docker build -t whisper-rdna4 .
+```
+
+Honest heads-up on size: the base image (`rocm/pytorch`) ships the full ROCm
+userspace stack, hipBLASLt, MIOpen, and a prebuilt PyTorch — it's large (tens
+of GB pulled/uncompressed). Expect a real wait on the first build or pull;
+Docker layer caching makes every build after that fast.
+
+Run the server:
+
+```bash
+docker run --rm -it \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video \
+  -p 8100:8100 \
+  -e HIP_VISIBLE_DEVICES=0 \
+  -v whisper-checkpoint-cache:/root/.cache/whisper \
+  whisper-rdna4
+```
+
+- `--device=/dev/kfd --device=/dev/dri --group-add video` — exposes the GPU
+  the way any ROCm container does; nothing GPU-specific to install on the
+  host beyond the kernel driver.
+- The named volume caches the checkpoint (`large-v3-turbo`, ~1.6GB) so it
+  downloads once on first run instead of on every `docker run` — without it,
+  the checkpoint lands in the container's throwaway filesystem and
+  re-downloads every time.
+- If the container fails at GPU init with a permissions/syscall error, some
+  Docker/runtime combinations need `--security-opt seccomp=unconfined`
+  added to the command above — not needed on every host, so it's left out
+  of the default command rather than loosened by default.
+
+First run downloads the checkpoint, then serves the API on port 8100:
+
+```bash
+curl -s http://localhost:8100/health
+
+curl -s -X POST http://localhost:8100/v1/audio/transcriptions \
+  -F "file=@episode.mp3" \
+  -F "response_format=verbose_json" | jq .
+```
+
+One-shot CLI mode instead of the server — transcribes a single mounted file
+and exits:
+
+```bash
+docker run --rm \
+  --device=/dev/kfd --device=/dev/dri --group-add video \
+  -v whisper-checkpoint-cache:/root/.cache/whisper \
+  -v "$(pwd)/episode.mp3":/audio/episode.mp3:ro \
+  whisper-rdna4 transcribe /audio/episode.mp3
+```
+
+Prints the transcript to stdout and writes `{text, segments}` JSON to
+`/tmp/segments.json` inside the container. Pass a second path to land it
+somewhere you mounted, e.g. `transcribe /audio/episode.mp3 /audio/out.json`.
+
+### docker-compose
+
+```bash
+docker compose up --build
+```
+
+Brings up one instance on port 8100 (`HIP_VISIBLE_DEVICES=0`). See
+`docker-compose.yml` for a commented two-instance variant (one container per
+GPU, ports 8101/8102) for multi-GPU boxes.
+
 ## How it's fast
 
 1. **Batch tiling.** 30 s chunks are processed 16 at a time. The encoder's

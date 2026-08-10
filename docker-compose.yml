@@ -1,0 +1,64 @@
+# Single-GPU service by default. See the commented block below for the
+# two-instance layout (one container per GPU, ports 8101/8102) used when
+# running on a dual-GPU box.
+services:
+  whisper-rdna4:
+    build: .
+    image: whisper-rdna4:latest
+    ports:
+      - "8100:8100"
+    environment:
+      - HIP_VISIBLE_DEVICES=0
+      - PORT=8100
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    volumes:
+      - whisper-checkpoint-cache:/root/.cache/whisper
+      # Mount an audio directory read-only to use the CLI `transcribe` mode:
+      # - ./audio:/audio:ro
+    restart: unless-stopped
+
+# --- Two-instance variant (one container per GPU) ---------------------------
+# Comment out the `whisper-rdna4` service above and uncomment this block to
+# run one instance per GPU (mirrors a dual-GPU production deployment: GPU 0
+# on 8101, GPU 1 on 8102).
+#
+#   whisper-rdna4-gpu0:
+#     build: .
+#     image: whisper-rdna4:latest
+#     ports:
+#       - "8101:8101"
+#     environment:
+#       - HIP_VISIBLE_DEVICES=0
+#       - PORT=8101
+#     devices:
+#       - /dev/kfd
+#       - /dev/dri
+#     group_add:
+#       - video
+#     volumes:
+#       - whisper-checkpoint-cache:/root/.cache/whisper
+#     restart: unless-stopped
+#
+#   whisper-rdna4-gpu1:
+#     build: .
+#     image: whisper-rdna4:latest
+#     ports:
+#       - "8102:8102"
+#     environment:
+#       - HIP_VISIBLE_DEVICES=1
+#       - PORT=8102
+#     devices:
+#       - /dev/kfd
+#       - /dev/dri
+#     group_add:
+#       - video
+#     volumes:
+#       - whisper-checkpoint-cache:/root/.cache/whisper
+#     restart: unless-stopped
+
+volumes:
+  whisper-checkpoint-cache:
