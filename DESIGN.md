@@ -99,7 +99,7 @@ kernels receive raw `tensor.data_ptr()` pointers plus the torch stream
 (`torch.cuda.current_stream().cuda_stream`). This pattern is smoke-tested
 (`~/r9700-whisper/smoke/`). No torch C++ extension API — keeps the ABI surface zero.
 
-Everything ships in `castria-experiments/experiments/rocm-whisper/` (Mac) and is
+Everything ships in the development tree on the workstation and is
 rsynced to `user@gpu-host:~/r9700-whisper/` for build + run. Never rsync with
 `--delete`. Layout:
 

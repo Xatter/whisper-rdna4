@@ -392,15 +392,15 @@ intermediates that K4/K5 would otherwise avoid materializing).
     restore it fully offset the GEMM launches saved. Left as a documented
     dead end in `whisper_rocm/model.py`.
 
-## Comparison vs production Castria transcripts
+## Comparison vs the production service's transcripts
 
 All 5 bench-corpus episodes are production episodes; their production
-transcripts (from prod's Whisper API service,
-`whisper.revealedpreferences.com`, OpenAI-compatible
-`/v1/audio/transcriptions` -- specific engine/model unknown from here, but
+transcripts (from the production Whisper API service, an internal
+OpenAI-compatible `/v1/audio/transcriptions` endpoint -- specific
+engine/model unknown from here, but
 the segment timestamps show it decoded WITH timestamps, unlike our
 notimestamps pipeline) are exported locally at
-`castria-experiments/experiments/data/episodes/{uuid}.json`. This section
+per-episode JSON files in the private experiments tree. This section
 triangulates: how far is *our* transcript from production, how far is the
 *old baseline's* transcript from production, and does that put our
 divergence number in context.
