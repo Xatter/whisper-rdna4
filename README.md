@@ -45,6 +45,23 @@ No local ROCm/PyTorch install needed — everything runs inside the container.
 You still need the host's `amdgpu` kernel driver and `/dev/kfd` + `/dev/dri`
 present, same as any ROCm container workload.
 
+**Prebuilt image** (fastest path — pull and run):
+
+```bash
+docker run --rm -it --device=/dev/kfd --device=/dev/dri --group-add video \
+  -p 8100:8100 -v whisper-checkpoint-cache:/root/.cache/whisper \
+  ghcr.io/xatter/whisper-rdna4:rocm7.2
+```
+
+Then transcribe something:
+
+```bash
+curl -F "file=@episode.mp3" -F "response_format=verbose_json" \
+  http://localhost:8100/v1/audio/transcriptions
+```
+
+**Or build it yourself:**
+
 ```bash
 git clone https://github.com/Xatter/whisper-rdna4.git
 cd whisper-rdna4
