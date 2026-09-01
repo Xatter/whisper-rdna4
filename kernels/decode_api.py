@@ -18,7 +18,9 @@ which one is loaded.
 """
 
 import ctypes
+import glob
 import os
+import shutil
 import subprocess
 import threading
 
@@ -34,7 +36,14 @@ SELF_T_CAP = 448      # self-attn cache capacity (whisper large-v3-turbo)
 CROSS_T_CAP = 1500    # cross-attn encoder sequence length
 
 _KERNELS_DIR = os.path.dirname(os.path.abspath(__file__))
-_HIPCC = "/opt/rocm/bin/hipcc"
+# hipcc location differs by ROCm packaging: a system install puts it at
+# /opt/rocm/bin/hipcc, while ROCm 10's pip/wheel SDK (_rocm_sdk_core) puts
+# it only on PATH. Mirror kernels/build.sh's resolution order; $HIPCC wins.
+_HIPCC = (
+    os.environ.get("HIPCC")
+    or shutil.which("hipcc")
+    or os.path.join(os.environ.get("ROCM_PATH", "/opt/rocm"), "bin", "hipcc")
+)
 _OFFLOAD_ARCH = "gfx1201"
 _COMBINED_SO = os.path.join(_KERNELS_DIR, "libwhisper_kernels.so")
 _PRIVATE_SO = os.path.join(_KERNELS_DIR, ".libdecode_kernels.so")
@@ -54,8 +63,41 @@ def _needs_rebuild(so_path: str, sources) -> bool:
     return any(os.path.getmtime(s) > so_mtime for s in sources)
 
 
+def _ensure_hip_linker_name() -> None:
+    """Make hipcc's absolute-path reference to libamdhip64.so resolve.
+
+    ROCm 10's pip/wheel SDK ships only libamdhip64.so.<N> (the SONAME), not
+    the unversioned libamdhip64.so linker name, so the link step fails. hipcc
+    hands the linker that absolute path, so the name has to exist next to the
+    SONAME. A system ROCm (<= 7.2) ships both names and this is a no-op.
+    Mirrors the same block in kernels/build.sh; failures are left to hipcc to
+    report, since this is only ever a best-effort repair.
+    """
+    hipconfig = os.path.join(os.path.dirname(_HIPCC), "hipconfig")
+    if not os.access(hipconfig, os.X_OK):
+        return
+    try:
+        root = subprocess.run(
+            [hipconfig, "--path"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return
+    hip_lib = os.path.join(root, "lib")
+    linker_name = os.path.join(hip_lib, "libamdhip64.so")
+    if not os.path.isdir(hip_lib) or os.path.exists(linker_name):
+        return
+    soname = sorted(glob.glob(os.path.join(hip_lib, "libamdhip64.so.*")))
+    if not soname:
+        return
+    try:
+        os.symlink(soname[0], linker_name)
+    except OSError:
+        pass  # read-only SDK dir -- hipcc will report the real link error
+
+
 def _compile_private_so() -> str:
     if _needs_rebuild(_PRIVATE_SO, _OWN_SOURCES):
+        _ensure_hip_linker_name()
         cmd = [
             _HIPCC, "-fPIC", "-shared",
             f"--offload-arch={_OFFLOAD_ARCH}", "-O2",

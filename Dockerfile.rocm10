@@ -1,0 +1,46 @@
+# whisper-rdna4 on ROCm 10 -- A/B variant of the default ROCm 7.2 Dockerfile.
+#
+# Same rule as the ROCm 7.2 image: the base image's ROCm major must match the
+# hipcc that compiles kernels/*.hip, because the .so is dlopen'd into the
+# torch process and shares its HIP runtime. Here both come from the same
+# rocm/pytorch:rocm10.0 base, so they match by construction.
+#
+# gfx1201 is officially supported on ROCm 10.0.0 with torch 2.13.0
+# (torch[device-gfx1201]==2.13.0+rocm10.0.0). This base image ships that
+# pairing prebuilt.
+#
+# Build:  docker build -f Dockerfile.rocm10 -t whisper-rdna4:rocm10 .
+FROM rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0
+
+WORKDIR /app
+
+# Repo deps not already in the base image. torch/torchvision/torchaudio ship
+# with rocm/pytorch, ROCm-matched -- do not reinstall them here.
+RUN pip install --no-cache-dir \
+        openai-whisper \
+        soundfile \
+        scipy \
+        tiktoken \
+        numpy \
+        silero-vad \
+        onnxruntime \
+        fastapi \
+        uvicorn \
+        python-multipart
+
+COPY . /app
+RUN chmod +x /app/entrypoint.sh
+
+# Compile the fused decode kernels. No GPU needed at build time --
+# hipcc cross-compiles directly for --offload-arch=gfx1201.
+RUN cd kernels && bash build.sh
+
+ENV WHISPER_CHECKPOINT=/root/.cache/whisper/large-v3-turbo.pt \
+    PORT=8100 \
+    HIP_VISIBLE_DEVICES=0 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8100
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["serve"]
