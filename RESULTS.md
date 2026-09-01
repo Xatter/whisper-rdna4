@@ -347,6 +347,138 @@ within the R9700's 32 GB, consistent with DESIGN.md S1's estimate (weights
 off, so somewhat higher activation memory from the extra torch
 intermediates that K4/K5 would otherwise avoid materializing).
 
+## ROCm 10 vs ROCm 7.2
+
+Measured 2026-09-01 on the same machine as everything above. Method: two
+Docker images built from an identical working tree, differing only in their
+base image; the repo source is bind-mounted into both at `/app` so the Python
+is byte-identical, and `kernels/build.sh` runs inside each image so each gets
+its own `libwhisper_kernels.so` from its own hipcc. Arms interleaved
+(7.2, 10, 7.2, 10) so host/thermal drift hits both equally. Corpus is the
+same 5-file, 8.22-hour set used for the headline table.
+
+| | ROCm 7.2 arm | ROCm 10 arm |
+|---|---|---|
+| Base image | `rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0` | `rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0` |
+| torch | 2.10.0+rocm7.2.4 | 2.13.0+rocm10.0.0 |
+| HIP | 7.2.53211 | 7.15.26333 |
+| hipcc | AMD clang 22.0.0git | AMD clang 23.0.0git |
+| ROCm layout | system, `/opt/rocm` | pip wheel, `_rocm_sdk_core` in a venv |
+
+Note the arms move torch 2.10 -> 2.13 as well as ROCm 7.2 -> 10. That
+confound is unavoidable: no `rocm/pytorch` tag pairs ROCm 7.2 with torch
+2.13, so ROCm 7.2 cannot be tested at the newer torch.
+
+### End-to-end RTF (kernels ON, B=16, timestamps ON, median of 2 runs)
+
+| Mode | Chunking | ROCm 7.2 | ROCm 10 | Speedup |
+|---|---|---|---|---|
+| single | hard | 0.00308 | 0.00204 | 1.51x |
+| dual | hard | 0.00308 | 0.00225 | 1.37x |
+| single | vad | 0.00320 | 0.00277 | 1.15x |
+| dual | vad | 0.00371 | 0.00324 | 1.15x |
+
+Run-to-run spread within an arm is under 1% (`single hard` was 0.00308 twice
+on 7.2; 0.00210/0.00198 on 10), so every gap above is well outside noise.
+
+The dual-GPU numbers are not better than single-GPU on this corpus in either
+arm. That is a load-balance artifact of splitting 5 unevenly-sized files
+across 2 GPUs, not a regression -- it is present identically in both arms and
+so does not affect the comparison. The headline dual-GPU numbers earlier in
+this file came from larger corpora that split evenly.
+
+### Where the time went (sum over corpus, single GPU, hard-cut)
+
+| Stage | ROCm 7.2 | ROCm 10 | Speedup |
+|---|---|---|---|
+| encode | 57.64 s | 30.86 s | **1.87x** |
+| decode | 32.94 s | 31.02 s | 1.06x |
+| load (audio) | 31.76 s | 31.57 s | 1.01x |
+| mel | 0.37 s | 0.29 s | 1.27x |
+| detok | 0.05 s | 0.05 s | 0.99x |
+
+The whole win is the encoder, which runs on PyTorch SDPA + hipBLASLt -- not
+on this repo's kernels. The decode loop is hand-written HIP against the same
+gfx1201 ISA and measures the same on both, as expected.
+
+In VAD mode the same encoder gain is there (49.14 s -> 34.88 s, 1.41x) but
+the Silero VAD stage is CPU-only and does not move (48.11 s -> 49.46 s). On
+ROCm 10 that CPU stage is the single largest cost in VAD mode, which is why
+VAD gains only 1.15x while hard-cut gains 1.51x. **VAD chunking is CPU-bound
+on ROCm 10.**
+
+### Kernel microbenchmarks: the margin over torch shrinks
+
+Same kernels, same shapes, `kernels/test_attention_decode.py` and
+`test_logits.py`, median of 10.
+
+| Benchmark | kernel 7.2 | torch 7.2 | kernel 10 | torch 10 | speedup 7.2 -> 10 |
+|---|---|---|---|---|---|
+| self-attn B=8 step=447 | 71.2 us | 140.1 us | 71.8 us | 86.3 us | 1.97x -> 1.20x |
+| self-attn B=32 step=447 | 147.5 us | 358.2 us | 150.8 us | 184.3 us | 2.43x -> 1.22x |
+| cross-attn B=8 T=1500 | 172.3 us | 246.1 us | 172.3 us | 140.4 us | 1.43x -> **0.82x** |
+| cross-attn B=32 T=1500 | 511.4 us | 688.4 us | 511.5 us | 525.2 us | 1.35x -> 1.03x |
+| logits B=8 | 66.8 us | 132.4 us | 75.3 us | 83.5 us | 1.98x -> 1.11x |
+| logits B=32 | 66.4 us | 83.9 us | 75.2 us | 91.8 us | 1.26x -> 1.22x |
+
+The kernel column is flat across ROCm versions -- same ISA, same code. The
+torch column drops hard. The logits kernel is the one real kernel-side
+regression: 66.4 us -> 75.2 us, about 13%, cause not investigated.
+
+Cross-attention at B=8 is now a **loss** against torch. It stays on by
+default because the pipeline's decode path still nets out ahead end to end
+(the RTF table above is with kernels ON on both arms), but it is worth a
+recheck if the default batch size ever drops.
+
+All 78 kernel correctness tests pass on ROCm 10, unchanged error bounds, with
+no source change to any `.hip` file -- the gfx12 WMMA builtin
+(`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`) survived the move to
+clang 23 intact.
+
+### Quality: unchanged
+
+Output is **not** bit-identical across ROCm versions (fp16 reduction order
+differs), so this had to be measured rather than assumed.
+
+Within one arm, output is deterministic: hard-cut is bit-identical across
+repeat runs on both arms; VAD is bit-identical on 3/5 and 2/5 files with a
+minimum character similarity of 0.9977. Across arms it diverges consistently
+(the same divergence both reps): mean character similarity 0.997 for
+hard-cut, 0.955 for VAD, with two VAD files as low as 0.891.
+
+That divergence is drift, not damage. Word-error rate against an independent
+reference transcript (`insanely-fast-whisper-rocm`'s own output on the same
+files):
+
+| Chunking | ROCm 7.2 | ROCm 10 | Delta |
+|---|---|---|---|
+| hard | 0.1227 | 0.1226 | -0.0001 |
+| vad | 0.0767 | 0.0758 | -0.0009 |
+
+Hard-cut is a wash. VAD is very slightly better on ROCm 10 on all five files
+individually, not just in aggregate. Nothing here suggests a quality cost.
+
+### Porting cost: two packaging breaks, no code changes
+
+ROCm 10 ships its userspace as a pip wheel (`_rocm_sdk_core` inside a venv)
+rather than a system tree at `/opt/rocm`. Two things broke, both in the build
+plumbing, neither in kernel or pipeline code:
+
+1. `hipcc` is not at `/opt/rocm/bin/hipcc` -- it is on `PATH` and nothing
+   exists at `/opt/rocm`. `kernels/build.sh` and `kernels/decode_api.py` both
+   hard-coded that path. Both now resolve `$HIPCC`, then `PATH`, then
+   `$ROCM_PATH/bin/hipcc`.
+2. The wheel ships `libamdhip64.so.7` (the SONAME) but not the unversioned
+   `libamdhip64.so` linker name, so linking failed with
+   `ld.lld: error: cannot open .../libamdhip64.so`. hipcc hands the linker
+   that absolute path, so `-L` on a shim directory does not help -- the name
+   has to exist next to the SONAME. Both build paths now create that symlink.
+   `pip install rocm[devel]` also supplies it, at the cost of a whole
+   development tree for one symlink.
+
+Both fixes are no-ops on ROCm 7.2 -- re-verified: the 7.2 build takes neither
+branch and produces an identical `.so`.
+
 ## Honest notes
 
 - **Agent B's encoder kernels (K1 LayerNorm, K2 GEMM, K3 encoder

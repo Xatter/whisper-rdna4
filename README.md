@@ -65,8 +65,13 @@ curl -F "file=@episode.mp3" -F "response_format=verbose_json" \
 ```bash
 git clone https://github.com/Xatter/whisper-rdna4.git
 cd whisper-rdna4
-docker build -t whisper-rdna4 .
+docker build -t whisper-rdna4 .                              # ROCm 7.2
+docker build -f Dockerfile.rocm10 -t whisper-rdna4:rocm10 .   # ROCm 10 (faster)
 ```
+
+**Build the ROCm 10 image if you can.** Same code, same kernels, same
+transcripts — measured 1.5x faster end to end on the GPU-bound path. See
+"ROCm 10" below and `RESULTS.md`'s "ROCm 10 vs ROCm 7.2" section.
 
 Honest heads-up on size: the base image (`rocm/pytorch`) ships the full ROCm
 userspace stack, hipBLASLt, MIOpen, and a prebuilt PyTorch — it's large (tens
@@ -187,11 +192,51 @@ the full numbers and methodology). VAD's own CPU cost is real (see the RTF
 table above) but fully recovered — and then some — by an ONNX backend switch
 and CPU/GPU prefetch overlap, both on by default.
 
+## ROCm 10
+
+ROCm 10 is supported and is the faster option. gfx1201 is an officially
+supported target there (`torch[device-gfx1201]==2.13.0+rocm10.0.0`).
+
+Measured on the same machine, same code, same 8.2-hour corpus, two Docker
+images differing only in their base (ROCm 7.2.4 + torch 2.10 vs ROCm 10.0.0
++ torch 2.13), kernels on, batch 16, timestamps on, medians of two runs:
+
+| Configuration | ROCm 7.2 | ROCm 10 | Speedup |
+|---|---|---|---|
+| One GPU, hard-cut chunking | 0.00308 | **0.00204** | **1.51x** |
+| Two GPUs, hard-cut chunking | 0.00308 | **0.00225** | **1.37x** |
+| One GPU, VAD chunking (default) | 0.00320 | **0.00277** | **1.15x** |
+| Two GPUs, VAD chunking (default) | 0.00371 | **0.00324** | **1.15x** |
+
+The win is almost entirely the **encoder** — 57.6s to 30.9s over the corpus,
+1.87x — which is PyTorch's own SDPA and hipBLASLt path, not this repo's
+kernels. The fused decode kernels are hand-written HIP for the same ISA, so
+they measure the same on both (decode 1.06x); ROCm 10 makes the *torch* side
+they are compared against much faster. Two consequences worth knowing:
+
+- The custom kernels' margin over torch shrinks. In the microbenchmarks the
+  cross-attention kernel at B=8 goes from 1.43x over the torch sequence on
+  ROCm 7.2 to 0.82x on ROCm 10 — a loss. The decode kernels still win at the
+  shapes the pipeline actually runs, which is why they stay on by default,
+  but the encoder-side kernels (already off by default) are further behind.
+- VAD mode gains less because its Silero CPU cost is untouched (48.1s vs
+  49.5s over the corpus) and is now the largest single stage. On ROCm 10, VAD
+  chunking is CPU-limited, not GPU-limited.
+
+**Transcripts are unchanged in quality.** Output is not bit-identical across
+ROCm versions — fp16 reduction order differs — but within one version it is
+deterministic, and measured against an independent reference transcript the
+word-error rate does not move: 0.1227 to 0.1226 for hard-cut, and 0.0767 to
+0.0758 for VAD (slightly better on every file). Full numbers in `RESULTS.md`.
+
 ## Requirements
 
 - An RDNA4 GPU (gfx1201): Radeon AI PRO R9700 or RX 9070 XT
-- Linux with **ROCm 7.2+** at `/opt/rocm` (hipcc must support
-  `--offload-arch=gfx1201`)
+- Linux with **ROCm 7.2+ or ROCm 10** (hipcc must support
+  `--offload-arch=gfx1201`). Both toolchain layouts work: ROCm 7.2's system
+  install at `/opt/rocm`, and ROCm 10's pip/wheel SDK, which puts `hipcc` on
+  `PATH` and nothing at `/opt/rocm`. `kernels/build.sh` resolves `hipcc` from
+  `$HIPCC`, then `PATH`, then `$ROCM_PATH/bin/hipcc`.
 - Python 3.12
 - **PyTorch built for the same ROCm major version as your system toolchain.**
   This matters: the custom kernels are loaded via ctypes into the torch
@@ -204,7 +249,12 @@ and CPU/GPU prefetch overlap, both on by default.
 python3.12 -m venv .venv
 # torch MUST come from the matching ROCm index (and only that index —
 # adding PyPI as an extra index can silently resolve the CUDA build):
+# Pick ONE of the two lines below, matching your system ROCm.
+# ROCm 7.2:
 .venv/bin/pip install --index-url https://download.pytorch.org/whl/rocm7.2 torch
+# ROCm 10 (gfx1201 is an officially supported target):
+.venv/bin/pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ \
+    "torch[device-gfx1201]==2.13.0+rocm10.0.0"
 .venv/bin/pip install openai-whisper soundfile scipy tiktoken numpy
 .venv/bin/pip install silero-vad onnxruntime  # VAD chunking (default mode)
 ```

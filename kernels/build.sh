@@ -9,9 +9,50 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-HIPCC=/opt/rocm/bin/hipcc
+# hipcc location differs by ROCm packaging:
+#   ROCm <= 7.2  -- system install, /opt/rocm/bin/hipcc
+#   ROCm 10      -- pip/wheel SDK (_rocm_sdk_core), hipcc only on PATH
+# Resolve in that order of specificity; $HIPCC overrides everything.
+if [ -z "${HIPCC:-}" ]; then
+  if command -v hipcc >/dev/null 2>&1; then
+    HIPCC=$(command -v hipcc)
+  elif [ -x "${ROCM_PATH:-/opt/rocm}/bin/hipcc" ]; then
+    HIPCC="${ROCM_PATH:-/opt/rocm}/bin/hipcc"
+  else
+    echo "hipcc not found: not on PATH and not at \${ROCM_PATH:-/opt/rocm}/bin/hipcc" >&2
+    echo "set HIPCC=/path/to/hipcc to override" >&2
+    exit 1
+  fi
+fi
 ARCH=gfx1201
 OUT=libwhisper_kernels.so
+
+# ROCm 10's pip/wheel SDK (_rocm_sdk_core) ships only libamdhip64.so.<N>, the
+# SONAME -- not the unversioned libamdhip64.so linker name -- so the link step
+# fails with
+#   ld.lld: error: cannot open .../libamdhip64.so: No such file or directory
+# hipcc hands the linker that absolute path, so -L on a shim dir does not help;
+# the name has to exist next to the SONAME. Create it. Both realistic ROCm 10
+# installs are writable here (root in a container, the user's own venv on bare
+# metal). `pip install rocm[devel]` also supplies the name, at the cost of a
+# whole development tree for one symlink.
+# A system ROCm (<= 7.2, /opt/rocm) ships both names, so none of this runs.
+HIPCONFIG="$(dirname "$HIPCC")/hipconfig"
+if [ -x "$HIPCONFIG" ]; then
+  HIP_LIB="$("$HIPCONFIG" --path 2>/dev/null)/lib"
+  if [ -d "$HIP_LIB" ] && [ ! -e "$HIP_LIB/libamdhip64.so" ]; then
+    SONAME=$(ls "$HIP_LIB"/libamdhip64.so.* 2>/dev/null | head -1)
+    if [ -n "$SONAME" ]; then
+      if ln -sf "$SONAME" "$HIP_LIB/libamdhip64.so" 2>/dev/null; then
+        echo "note: added missing linker name $HIP_LIB/libamdhip64.so -> $(basename "$SONAME")"
+      else
+        echo "$HIP_LIB is not writable and has no libamdhip64.so linker name." >&2
+        echo "Run: ln -s $SONAME $HIP_LIB/libamdhip64.so   (or pip install 'rocm[devel]')" >&2
+        exit 1
+      fi
+    fi
+  fi
+fi
 
 SOURCES=(*.hip)
 if [ ! -e "${SOURCES[0]}" ]; then
